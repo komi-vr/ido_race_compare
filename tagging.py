@@ -27,6 +27,8 @@ def annotate_video(
 ) -> None:
     """
     pygame UIでタグ付け（画面移動なし）
+    JSONは t(秒) と frame(フレーム番号) の両方を保存する。
+    旧JSON（tだけ）も読み込み可能で、保存時にframeが補完される。
 
     キー操作:
       SPACE : 再生/停止
@@ -62,15 +64,18 @@ def annotate_video(
     if resume_if_exists and os.path.exists(out_json_path):
         try:
             prev = load_annotation(out_json_path)
-            if prev.video_path != video_path:
+            if prev.video_path and prev.video_path != video_path:
                 print(
                     f"[WARN] Existing JSON refers to a different video:\n"
                     f"  json video_path: {prev.video_path}\n"
                     f"  current video:   {video_path}\n"
                     f"  -> tags will be loaded anyway."
                 )
+
+            # ★ 旧JSON(tだけ)でも load_annotation が frame を補完してくれる
             tags = prev.tags[:]
             tags.sort(key=lambda x: x.t)
+
             if initial_seek_sec is None and tags:
                 initial_seek_sec = tags[-1].t
         except Exception as e:
@@ -84,7 +89,6 @@ def annotate_video(
     cur_frame = int(_clamp(initial_seek_sec * fps, 0, max(0, total_frames - 1)))
     cap.set(cv2.CAP_PROP_POS_FRAMES, cur_frame)
 
-    # ===== pygame init =====
     import pygame
     pygame.init()
     pygame.display.set_caption(window_name)
@@ -104,7 +108,6 @@ def annotate_video(
         font = pygame.font.SysFont(None, 28)
         font_small = pygame.font.SysFont(None, 22)
 
-
     playing = False
     show_list = True
     input_mode = False
@@ -112,7 +115,6 @@ def annotate_video(
     input_hint = "Type tag name, Enter=OK, Esc=Cancel"
     selected_idx = max(0, len(tags) - 1) if tags else 0
 
-    # seek helpers
     def set_frame(idx: int) -> None:
         nonlocal cur_frame
         cur_frame = int(_clamp(idx, 0, max(0, total_frames - 1)))
@@ -122,7 +124,7 @@ def annotate_video(
         set_frame(cur_frame + int(dt * fps))
 
     def jump_to_time_sec(tsec: float) -> None:
-        set_frame(int(tsec * fps))
+        set_frame(int(round(tsec * fps)))
 
     def current_time_sec() -> float:
         return cur_frame / fps
@@ -133,7 +135,6 @@ def annotate_video(
             tags.pop(selected_idx)
             selected_idx = min(selected_idx, max(0, len(tags) - 1))
 
-    # render helpers
     def draw_text(s: str, x: int, y: int, color=(255, 255, 255), small=False) -> None:
         f = font_small if small else font
         surf = f.render(s, True, color)
@@ -145,7 +146,6 @@ def annotate_video(
         screen.blit(r, (x, y))
 
     running = True
-
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -162,8 +162,10 @@ def annotate_video(
                     elif event.key == pygame.K_RETURN:
                         name = input_text.strip()
                         if name:
-                            t = current_time_sec()
-                            tags.append(Tag(name=name, t=t))
+                            # ★ frame と t を両方保存
+                            fr = int(cur_frame)
+                            t = fr / fps
+                            tags.append(Tag(name=name, t=t, frame=fr))
                             tags.sort(key=lambda x: x.t)
                             selected_idx = max(0, len(tags) - 1)
                         input_mode = False
@@ -194,7 +196,12 @@ def annotate_video(
                 elif event.key == pygame.K_RETURN:
                     if tags and 0 <= selected_idx < len(tags):
                         playing = False
-                        jump_to_time_sec(tags[selected_idx].t)
+                        # frameがあるならそれを優先してジャンプ（精密）
+                        tg = tags[selected_idx]
+                        if tg.frame is not None:
+                            set_frame(tg.frame)
+                        else:
+                            jump_to_time_sec(tg.t)
 
                 # Undo last tag
                 elif event.key == pygame.K_u:
@@ -202,10 +209,7 @@ def annotate_video(
                         tags.pop()
                         selected_idx = min(selected_idx, max(0, len(tags) - 1))
 
-                # ★ mac対策：Delete相当を複数に割当
-                # - Backspace: macの「Delete」キー
-                # - Delete: fn+Delete などの前方削除がある環境
-                # - X: 念のため
+                # mac delete variants
                 elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_x):
                     delete_selected_tag()
 
@@ -232,13 +236,13 @@ def annotate_video(
 
         # update frame
         if playing:
-            ok, bgr = cap.read()
+            ok, _ = cap.read()
             if not ok:
                 playing = False
             else:
                 cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-        # show current frame
+        # show current frame (read at cur_frame)
         cap.set(cv2.CAP_PROP_POS_FRAMES, cur_frame)
         ok, bgr = cap.read()
         if not ok:
@@ -272,8 +276,8 @@ def annotate_video(
 
         # tag list overlay
         if show_list:
-            panel_w = min(520, screen_w - 20)
-            panel_h = min(320, screen_h - 170)
+            panel_w = min(600, screen_w - 20)
+            panel_h = min(340, screen_h - 170)
             x0 = 10
             y0 = 150
             draw_rect(x0, y0, panel_w, panel_h, color=(0, 0, 0), alpha=140)
@@ -281,6 +285,7 @@ def annotate_video(
 
             max_rows = (panel_h - 44) // 22
             max_rows = max(1, max_rows)
+
             if tags:
                 start = max(0, selected_idx - max_rows + 1)
                 end = min(len(tags), start + max_rows)
@@ -290,7 +295,8 @@ def annotate_video(
             y = y0 + 34
             for i in range(start, end):
                 tg = tags[i]
-                line = f"[{i:03d}] {tg.t:8.3f}s  {_sec_to_str(tg.t)}   {tg.name}"
+                fr = tg.frame if tg.frame is not None else int(round(tg.t * fps))
+                line = f"[{i:03d}] fr={fr:7d}  t={tg.t:8.3f}s  {_sec_to_str(tg.t)}   {tg.name}"
                 if i == selected_idx:
                     draw_rect(x0 + 6, y - 2, panel_w - 12, 22, color=(255, 255, 255), alpha=40)
                     draw_text(line, x0 + 10, y, color=(255, 255, 255), small=True)
@@ -304,6 +310,8 @@ def annotate_video(
     cap.release()
     pygame.quit()
 
+    # ★ 保存前に、古いtag(tだけ)にも frame を補完して保存される
+    # ここでは fps を annotation.fps として保存する
     ann = Annotation(video_path=video_path, fps=fps, tags=tags)
     save_annotation(ann, out_json_path)
     print(f"Saved annotation: {out_json_path}")
