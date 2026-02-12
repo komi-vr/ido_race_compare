@@ -1,105 +1,194 @@
-from typing import Dict
+from __future__ import annotations
+
+from typing import Dict, Any, Optional, Tuple
+import os
+import click
+import yaml
+
 from rc_io import load_annotation
 from tagging import annotate_video
 from alignment import build_alignment
-from render import render_comparison_video
+from render import render_comparison_video, preview_comparison_video
+
+
+def _load_yaml(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise click.ClickException("config.yaml のトップレベルは dict(map) にしてください。")
+    return data
+
+
+def _get(d: Dict[str, Any], key: str, default=None):
+    v = d.get(key, default)
+    return default if v is None else v
+
+
+def _require(d: Dict[str, Any], key: str, where: str) -> Any:
+    if key not in d or d[key] is None:
+        raise click.ClickException(f"config の '{where}.{key}' が必要です。")
+    return d[key]
+
+
+def _as_tuple2(v, where: str) -> Optional[Tuple[int, int]]:
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        return (int(v[0]), int(v[1]))
+    raise click.ClickException(f"config の '{where}' は [w, h] の形式にしてください。")
+
+
+def _default_json_path_for_video(video_path: str) -> str:
+    # videos/foo.mp4 -> videos/foo.json
+    base, _ = os.path.splitext(video_path)
+    return base + ".json"
 
 
 def _first_time_by_tag(ann, name: str) -> float:
-    # 同名タグが複数ある場合は「最初の1つ」を採用
     tmin = None
     for tg in ann.tags:
         if tg.name == name:
             if tmin is None or tg.t < tmin:
                 tmin = tg.t
     if tmin is None:
-        raise ValueError(f"Tag '{name}' not found in {ann.video_path}")
+        raise click.ClickException(f"タグ '{name}' が見つかりません: {ann.video_path}")
     return float(tmin)
 
 
-def main():
-    # ========= モード切替 =========
-    MODE = "compare"  # "tag" or "compare"
+@click.group()
+def cli():
+    pass
 
-    # ========= tag モード用 =========
-    vid_name = "haruna_keitokoyo_249s"
-    vid_name = "haruna_dirtyotaku_246s"
-    TAG_VIDEO_PATH = f"videos/{vid_name}.mp4"
-    TAG_OUT_JSON = f"videos/{vid_name}.json"
-    TAG_INITIAL_SEEK_SEC = None  # Noneなら最後のタグから再開（resume実装済み想定）
 
-    # ========= compare モード用 =========
-    JSON_PATHS: Dict[str, str] = {
-        "DirtyOtaku": "videos/haruna_dirtyotaku_246s.json",
-        "Kei Tokoyo": "videos/haruna_keitokoyo_249s.json",
-    }
-    OUT_VIDEO_PATH = "compare_output_v2.mp4"
+@cli.command()
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+def tag(config_path: str):
+    """動画にタグを打ってJSON保存（設定はYAMLから読む）"""
+    cfg = _load_yaml(config_path)
+    tag_cfg = _get(cfg, "tag", {})
 
-    # ========= タグ定義 =========
-    START_TAG = "start"
-    END_TAG = "end"
+    video_path = _require(tag_cfg, "video_path", "tag")
 
-    # ========= 音声モード =========
-    # "none"（音声なし） or "seg_fastest"（区間ごと最速の動画の音声）
-    AUDIO_MODE = "seg_fastest"
+    # ★ out_json_path は省略可：同じ場所・同じ名前 .json にする
+    out_json_path = _get(tag_cfg, "out_json_path", None)
+    if out_json_path is None:
+        out_json_path = _default_json_path_for_video(video_path)
 
-    # ========= 描画パラメータ =========
-    OUT_W = 1280
-    OUT_H = 720
-    BAR_H = 190
-    MARGIN = 8
-    OUT_FPS = 60
+    initial_seek_sec = _get(tag_cfg, "initial_seek_sec", None)
+    resume_if_exists = bool(_get(tag_cfg, "resume_if_exists", True))
+    window_size = _as_tuple2(_get(tag_cfg, "window_size", [1280, 720]), "tag.window_size")
 
-    # 日本語フォント（プロジェクト内パス推奨）
-    FONT_PATH = "GenShinGothic-Monospace-Medium.ttf"
+    common = _get(cfg, "common", {})
+    font_path = _get(common, "font_path", None)
 
-    if MODE == "tag":
-        annotate_video(
-            TAG_VIDEO_PATH,
-            TAG_OUT_JSON,
-            initial_seek_sec=TAG_INITIAL_SEEK_SEC,
-            resume_if_exists=True,
-            font_path=FONT_PATH,
-        )
-        return
+    annotate_video(
+        video_path,
+        out_json_path,
+        initial_seek_sec=initial_seek_sec,
+        resume_if_exists=resume_if_exists,
+        window_size=window_size,
+        font_path=font_path,
+    )
 
-    if MODE == "compare":
-        labels = list(JSON_PATHS.keys())
-        ann_paths = [JSON_PATHS[k] for k in labels]
-        anns = [load_annotation(p) for p in ann_paths]
 
-        # ★ start までの差を計算に入れない（映像には出す）前提のアラインメント
-        plan = build_alignment(anns, start_tag=START_TAG)
+@cli.command()
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+def compare(config_path: str):
+    """複数動画を比較して動画出力（設定はYAMLから読む）"""
+    cfg = _load_yaml(config_path)
 
-        video_paths = {label: ann.video_path for label, ann in zip(labels, anns)}
+    cmp_cfg = _get(cfg, "compare", {})
+    common = _get(cfg, "common", {})
+    render_cfg = _get(cfg, "render", {})
 
-        # ★ 各動画の start/end 時刻（全体タイム表示＆進捗%のため）
-        start_times = {label: _first_time_by_tag(ann, START_TAG) for label, ann in zip(labels, anns)}
-        end_times = {label: _first_time_by_tag(ann, END_TAG) for label, ann in zip(labels, anns)}
+    json_paths: Dict[str, str] = _require(cmp_cfg, "json_paths", "compare")
+    if not isinstance(json_paths, dict) or not json_paths:
+        raise click.ClickException("compare.json_paths は {label: path} の dict で指定してください。")
 
-        print("Common tags:", plan.common_tags)
-        print("Total output duration:", plan.total_out_dur)
-        print("Video labels:", list(video_paths.keys()))
-        print("Audio mode:", AUDIO_MODE)
+    out_video_path = _get(cmp_cfg, "out_video_path", "compare_output.mp4")
+    start_tag = _get(cmp_cfg, "start_tag", "start")
+    end_tag = _get(cmp_cfg, "end_tag", "end")
+    audio_mode = str(_get(cmp_cfg, "audio_mode", "none")).lower()
 
-        render_comparison_video(
-            video_paths=video_paths,
-            plan=plan,
-            out_path=OUT_VIDEO_PATH,
-            out_w=OUT_W,
-            out_h=OUT_H,
-            bar_h=BAR_H,
-            margin=MARGIN,
-            font_path=FONT_PATH,
-            fps=OUT_FPS,
-            start_times=start_times,  # ★ 追加
-            end_times=end_times,      # ★ 追加
-            audio_mode=AUDIO_MODE,    # ★ 追加
-        )
-        return
+    out_w = int(_get(render_cfg, "out_w", 1280))
+    out_h = int(_get(render_cfg, "out_h", 720))
+    bar_h = int(_get(render_cfg, "bar_h", 210))
+    margin = int(_get(render_cfg, "margin", 10))
+    out_fps = int(_get(render_cfg, "fps", 60))
+    font_path = _get(common, "font_path", None)
 
-    raise ValueError(f"Unknown MODE: {MODE}")
+    labels = list(json_paths.keys())
+    anns = [load_annotation(json_paths[k]) for k in labels]
+
+    plan = build_alignment(anns, start_tag=start_tag)
+
+    video_paths = {label: ann.video_path for label, ann in zip(labels, anns)}
+    start_times = {label: _first_time_by_tag(ann, start_tag) for label, ann in zip(labels, anns)}
+    end_times = {label: _first_time_by_tag(ann, end_tag) for label, ann in zip(labels, anns)}
+
+    render_comparison_video(
+        video_paths=video_paths,
+        plan=plan,
+        out_path=out_video_path,
+        out_w=out_w,
+        out_h=out_h,
+        bar_h=bar_h,
+        margin=margin,
+        font_path=font_path,
+        fps=out_fps,
+        start_times=start_times,
+        end_times=end_times,
+        audio_mode=audio_mode,
+    )
+
+
+@cli.command()
+@click.option("--config", "config_path", required=True, type=click.Path(exists=True))
+def preview(config_path: str):
+    """出力せずpygameでプレビュー（設定はYAMLから読む）"""
+    cfg = _load_yaml(config_path)
+
+    cmp_cfg = _get(cfg, "compare", {})
+    common = _get(cfg, "common", {})
+    render_cfg = _get(cfg, "render", {})
+
+    json_paths: Dict[str, str] = _require(cmp_cfg, "json_paths", "compare")
+    if not isinstance(json_paths, dict) or not json_paths:
+        raise click.ClickException("compare.json_paths は {label: path} の dict で指定してください。")
+
+    start_tag = _get(cmp_cfg, "start_tag", "start")
+    end_tag = _get(cmp_cfg, "end_tag", "end")
+
+    out_w = int(_get(render_cfg, "out_w", 1280))
+    out_h = int(_get(render_cfg, "out_h", 720))
+    bar_h = int(_get(render_cfg, "bar_h", 210))
+    margin = int(_get(render_cfg, "margin", 10))
+    out_fps = int(_get(render_cfg, "fps", 60))
+    font_path = _get(common, "font_path", None)
+
+    labels = list(json_paths.keys())
+    anns = [load_annotation(json_paths[k]) for k in labels]
+    plan = build_alignment(anns, start_tag=start_tag)
+
+    video_paths = {label: ann.video_path for label, ann in zip(labels, anns)}
+    start_times = {label: _first_time_by_tag(ann, start_tag) for label, ann in zip(labels, anns)}
+    end_times = {label: _first_time_by_tag(ann, end_tag) for label, ann in zip(labels, anns)}
+
+    preview_comparison_video(
+        video_paths=video_paths,
+        plan=plan,
+        out_w=out_w,
+        out_h=out_h,
+        bar_h=bar_h,
+        margin=margin,
+        font_path=font_path,
+        fps=out_fps,
+        start_times=start_times,
+        end_times=end_times,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    cli()

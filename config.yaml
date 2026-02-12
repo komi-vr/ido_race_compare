@@ -1,0 +1,26 @@
+common:
+  font_path: "GenShinGothic-Monospace-Medium.ttf"
+
+tag:
+  video_path: "videos/haruna_keitokoyo_246s.mp4"
+  #video_path: "videos/haruna_dirtyotaku_249s.mp4"
+  #out_json_path: "videos/haruna_dirtyotaku_246s.json"
+  initial_seek_sec: null
+  resume_if_exists: true
+  window_size: [1280, 720]
+
+compare:
+  json_paths:
+    DirtyOtaku: "videos/haruna_dirtyotaku_249s.json"
+    Kei Tokoyo: "videos/haruna_keitokoyo_246s.json"
+  out_video_path: "compare_output.mp4"
+  start_tag: "start"
+  end_tag: "end"
+  audio_mode: "seg_fastest"   # "none" or "seg_fastest"
+
+render:
+  out_w: 1280
+  out_h: 720
+  bar_h: 210
+  margin: 10
+  fps: 60
