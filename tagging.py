@@ -22,8 +22,8 @@ def annotate_video(
     initial_seek_sec: Optional[float] = None,
     window_name: str = "tagger",
     resume_if_exists: bool = True,
-    # 追加: 表示サイズ（Noneなら動画サイズ）
     window_size: Optional[Tuple[int, int]] = (1280, 720),
+    font_path: Optional[str] = None,
 ) -> None:
     """
     pygame UIでタグ付け（画面移動なし）
@@ -33,12 +33,13 @@ def annotate_video(
       ←/→  : 1フレーム戻る/進む（停止中）
       Shift + ←/→ : 0.5秒戻る/進む
       T     : タグ入力モード開始（画面内で入力）
-      Enter : タグ確定（入力モード中）
+      Enter : (通常) 選択中タグの時刻にジャンプ / (入力中) タグ確定
       Esc   : 入力キャンセル（入力モード中）
-      Backspace : 文字削除（入力モード中）
+      Backspace : (入力中) 文字削除 / (通常) 選択タグ削除（macのDelete対策）
+      Delete / fn+Delete : 選択タグ削除（環境によって効く）
+      X     : 選択タグ削除（保険）
       U     : 直近タグを削除
       ↑/↓  : タグ一覧の選択（停止中推奨）
-      Delete: 選択中タグを削除
       R     : タグ一覧表示切替
       Q     : 終了して保存
     """
@@ -84,6 +85,7 @@ def annotate_video(
     cap.set(cv2.CAP_PROP_POS_FRAMES, cur_frame)
 
     # ===== pygame init =====
+    import pygame
     pygame.init()
     pygame.display.set_caption(window_name)
 
@@ -95,8 +97,13 @@ def annotate_video(
     screen = pygame.display.set_mode((screen_w, screen_h))
     clock = pygame.time.Clock()
 
-    font = pygame.font.SysFont(None, 28)
-    font_small = pygame.font.SysFont(None, 22)
+    if font_path:
+        font = pygame.font.Font(font_path, 28)
+        font_small = pygame.font.Font(font_path, 22)
+    else:
+        font = pygame.font.SysFont(None, 28)
+        font_small = pygame.font.SysFont(None, 22)
+
 
     playing = False
     show_list = True
@@ -114,8 +121,17 @@ def annotate_video(
     def jump_seconds(dt: float) -> None:
         set_frame(cur_frame + int(dt * fps))
 
+    def jump_to_time_sec(tsec: float) -> None:
+        set_frame(int(tsec * fps))
+
     def current_time_sec() -> float:
         return cur_frame / fps
+
+    def delete_selected_tag() -> None:
+        nonlocal selected_idx
+        if tags and 0 <= selected_idx < len(tags):
+            tags.pop(selected_idx)
+            selected_idx = min(selected_idx, max(0, len(tags) - 1))
 
     # render helpers
     def draw_text(s: str, x: int, y: int, color=(255, 255, 255), small=False) -> None:
@@ -128,12 +144,9 @@ def annotate_video(
         r.fill((color[0], color[1], color[2], alpha))
         screen.blit(r, (x, y))
 
-    # main loop
     running = True
-    frame_rgb = None
 
     while running:
-        # event handling
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
@@ -141,7 +154,7 @@ def annotate_video(
             if event.type == pygame.KEYDOWN:
                 mods = pygame.key.get_mods()
 
-                # input mode
+                # ===== input mode =====
                 if input_mode:
                     if event.key == pygame.K_ESCAPE:
                         input_mode = False
@@ -158,35 +171,43 @@ def annotate_video(
                     elif event.key == pygame.K_BACKSPACE:
                         input_text = input_text[:-1]
                     else:
-                        # text input: printable only
                         ch = event.unicode
                         if ch and ch.isprintable():
                             input_text += ch
-                    continue  # don't fall through while inputting
+                    continue
 
-                # normal mode
-                if event.key in (pygame.K_q,):
+                # ===== normal mode =====
+                if event.key == pygame.K_q:
                     running = False
 
                 elif event.key == pygame.K_SPACE:
                     playing = not playing
 
-                elif event.key in (pygame.K_r,):
+                elif event.key == pygame.K_r:
                     show_list = not show_list
 
-                elif event.key in (pygame.K_t,):
+                elif event.key == pygame.K_t:
                     input_mode = True
                     input_text = ""
 
-                elif event.key in (pygame.K_u,):
+                # Enter: jump to selected tag
+                elif event.key == pygame.K_RETURN:
+                    if tags and 0 <= selected_idx < len(tags):
+                        playing = False
+                        jump_to_time_sec(tags[selected_idx].t)
+
+                # Undo last tag
+                elif event.key == pygame.K_u:
                     if tags:
                         tags.pop()
                         selected_idx = min(selected_idx, max(0, len(tags) - 1))
 
-                elif event.key == pygame.K_DELETE:
-                    if tags and 0 <= selected_idx < len(tags):
-                        tags.pop(selected_idx)
-                        selected_idx = min(selected_idx, max(0, len(tags) - 1))
+                # ★ mac対策：Delete相当を複数に割当
+                # - Backspace: macの「Delete」キー
+                # - Delete: fn+Delete などの前方削除がある環境
+                # - X: 念のため
+                elif event.key in (pygame.K_BACKSPACE, pygame.K_DELETE, pygame.K_x):
+                    delete_selected_tag()
 
                 elif event.key == pygame.K_UP:
                     if tags:
@@ -196,7 +217,7 @@ def annotate_video(
                     if tags:
                         selected_idx = min(len(tags) - 1, selected_idx + 1)
 
-                # seek (prefer when paused)
+                # seek (paused)
                 elif event.key == pygame.K_LEFT and not playing:
                     if mods & pygame.KMOD_SHIFT:
                         jump_seconds(-0.5)
@@ -217,11 +238,10 @@ def annotate_video(
             else:
                 cur_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
 
-        # if paused, read current frame once per loop (keep in sync)
+        # show current frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, cur_frame)
         ok, bgr = cap.read()
         if not ok:
-            # end
             playing = False
             set_frame(max(0, total_frames - 1))
             cap.set(cv2.CAP_PROP_POS_FRAMES, cur_frame)
@@ -229,26 +249,22 @@ def annotate_video(
             if not ok:
                 break
 
-        # convert BGR->RGB, resize to window
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         if (rgb.shape[1], rgb.shape[0]) != (screen_w, screen_h):
             rgb = cv2.resize(rgb, (screen_w, screen_h), interpolation=cv2.INTER_AREA)
-        frame_rgb = rgb
 
-        # draw
-        # pygame expects (w,h,3) -> surface via surfarray
-        surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+        surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
         screen.blit(surf, (0, 0))
 
-        # HUD background
-        draw_rect(10, 10, screen_w - 20, 120, color=(0, 0, 0), alpha=140)
+        # HUD
+        draw_rect(10, 10, screen_w - 20, 130, color=(0, 0, 0), alpha=140)
         t = current_time_sec()
         draw_text(f"{os.path.basename(video_path)}", 20, 18)
         draw_text(f"t={t:8.3f}s ({_sec_to_str(t)})  frame={cur_frame}/{total_frames}  fps={fps:.2f}", 20, 48, small=True)
-        draw_text("SPACE play/pause | ←/→ step (paused) | Shift+←/→ 0.5s | T add tag | U undo | Q quit", 20, 72, small=True)
-        draw_text("↑/↓ select tag | Delete remove selected | R toggle list", 20, 94, small=True)
+        draw_text("SPACE play/pause | ←/→ step (paused) | Shift+←/→ 0.5s | T add tag | Enter jump", 20, 72, small=True)
+        draw_text("↑/↓ select tag | Backspace/Delete/X remove selected | U undo | R toggle list | Q quit", 20, 94, small=True)
 
-        # input mode overlay (no focus change)
+        # input overlay
         if input_mode:
             draw_rect(10, screen_h - 90, screen_w - 20, 80, color=(0, 0, 0), alpha=170)
             draw_text(input_hint, 20, screen_h - 82, small=True)
@@ -257,14 +273,12 @@ def annotate_video(
         # tag list overlay
         if show_list:
             panel_w = min(520, screen_w - 20)
-            panel_h = min(320, screen_h - 150)
+            panel_h = min(320, screen_h - 170)
             x0 = 10
-            y0 = 140
+            y0 = 150
             draw_rect(x0, y0, panel_w, panel_h, color=(0, 0, 0), alpha=140)
             draw_text(f"Tags ({len(tags)})", x0 + 10, y0 + 8)
 
-            # show last N with selection
-            # list scroll: keep selected visible
             max_rows = (panel_h - 44) // 22
             max_rows = max(1, max_rows)
             if tags:
@@ -285,13 +299,7 @@ def annotate_video(
                 y += 22
 
         pygame.display.flip()
-
-        # if paused, don't auto-advance
-        if playing:
-            # target FPS display (not video FPS; decode speed control)
-            clock.tick(60)
-        else:
-            clock.tick(30)
+        clock.tick(60 if playing else 30)
 
     cap.release()
     pygame.quit()

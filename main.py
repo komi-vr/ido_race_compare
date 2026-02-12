@@ -7,11 +7,11 @@ from render import render_comparison_video
 
 def main():
     # ========= モード切替 =========
-    MODE = "tag"  # "tag" or "compare"
+    MODE = "compare"  # "tag" or "compare"
 
     # ========= tag モード用 =========
     vid_name = "haruna_keitokoyo_249s"
-    #vid_name = "haruna_dirtyotaku_246s"
+    vid_name = "haruna_dirtyotaku_246s"
     TAG_VIDEO_PATH = f"videos/{vid_name}.mp4"
     TAG_OUT_JSON = f"videos/{vid_name}.json"
     TAG_INITIAL_SEEK_SEC = None  # Noneなら最後のタグから再開（resume実装済み想定）
@@ -32,7 +32,7 @@ def main():
     OUT_FPS = 60
 
     # 日本語を確実に出したいなら指定（無ければ None）
-    FONT_PATH = None  # 例: "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"
+    FONT_PATH = "GenShinGothic-Monospace-Medium.ttf"
 
     if MODE == "tag":
         annotate_video(
@@ -40,6 +40,7 @@ def main():
             TAG_OUT_JSON,
             initial_seek_sec=TAG_INITIAL_SEEK_SEC,
             resume_if_exists=True,
+            font_path=FONT_PATH,
         )
         return
 
