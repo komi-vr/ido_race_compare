@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict
 from rc_io import load_annotation
 from tagging import annotate_video
 from alignment import build_alignment
@@ -7,19 +7,22 @@ from render import render_comparison_video
 
 def main():
     # ========= モード切替 =========
-    MODE = "compare"  # "tag" or "compare"
+    MODE = "tag"  # "tag" or "compare"
 
     # ========= tag モード用 =========
-    TAG_VIDEO_PATH = "run1.mp4"
-    TAG_OUT_JSON = "run1.json"
-    TAG_INITIAL_SEEK_SEC = 0.0
+    vid_name = "haruna_keitokoyo_249s"
+    #vid_name = "haruna_dirtyotaku_246s"
+    TAG_VIDEO_PATH = f"videos/{vid_name}.mp4"
+    TAG_OUT_JSON = f"videos/{vid_name}.json"
+    TAG_INITIAL_SEEK_SEC = None  # Noneなら最後のタグから再開（resume実装済み想定）
 
     # ========= compare モード用 =========
-    JSON_PATHS: List[str] = [
-        "run1.json",
-        "run2.json",
-        # "run3.json",
-    ]
+    # ★ ここを dict にする： {"動画名": "annotation.json"}
+    JSON_PATHS: Dict[str, str] = {
+        "DirtyOtaku": "videos/haruna_dirtyotaku_246s.json",
+        "Kei Tokoyo": "videos/haruna_keitokoyo_249s.json",
+        # "別視点": "run3.json",
+    }
     OUT_VIDEO_PATH = "compare_output.mp4"
 
     # ========= 描画パラメータ =========
@@ -28,7 +31,7 @@ def main():
     MARGIN = 8
     OUT_FPS = 60
 
-    # 日本語タグ表示したいなら NotoSansCJK 等を指定（無ければ None でOK）
+    # 日本語を確実に出したいなら指定（無ければ None）
     FONT_PATH = None  # 例: "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"
 
     if MODE == "tag":
@@ -36,16 +39,25 @@ def main():
             TAG_VIDEO_PATH,
             TAG_OUT_JSON,
             initial_seek_sec=TAG_INITIAL_SEEK_SEC,
+            resume_if_exists=True,
         )
         return
 
     if MODE == "compare":
-        anns = [load_annotation(p) for p in JSON_PATHS]
-        video_paths = [a.video_path for a in anns]
+        # JSONをラベル付きで読む（順序は dict の定義順）
+        labels = list(JSON_PATHS.keys())
+        ann_paths = [JSON_PATHS[k] for k in labels]
+        anns = [load_annotation(p) for p in ann_paths]
 
+        # アラインメント計画
         plan = build_alignment(anns)
+
+        # render.py は {"動画名": 動画ファイルパス} を受け取るので組み立てる
+        video_paths = {label: ann.video_path for label, ann in zip(labels, anns)}
+
         print("Common tags:", plan.common_tags)
         print("Total output duration:", plan.total_out_dur)
+        print("Video labels:", list(video_paths.keys()))
 
         render_comparison_video(
             video_paths=video_paths,
