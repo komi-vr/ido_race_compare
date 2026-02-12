@@ -2,20 +2,21 @@ common:
   font_path: "GenShinGothic-Monospace-Medium.ttf"
 
 tag:
-  #video_path: "videos/haruna_keitokoyo_246s.mp4"
+  video_path: "videos/haruna_keitokoyo_246s.mp4"
   #video_path: "videos/haruna_dirtyotaku_249s.mp4"
-  video_path: "videos/haruna_momoka_270s.mp4"
+  #video_path: "videos/haruna_momoka_270s.mp4"
   #out_json_path: "videos/haruna_dirtyotaku_246s.json"
   initial_seek_sec: null
   resume_if_exists: true
-  window_size: [1280, 720]
+  window_size: [1700, 900]
+  reference_json_path: "videos/haruna_keitokoyo_246s.json"
 
 compare:
   json_paths:
     DirtyOtaku: "videos/haruna_dirtyotaku_249s.json"
     KeiTokoyo: "videos/haruna_keitokoyo_246s.json"
     #MomokaKisaragi: "videos/haruna_momoka_270s.json"
-  out_video_path: "compare_output_v4.mp4"
+  out_video_path: "compare_output_v5.mp4"
   start_tag: "start"
   end_tag: "end"
   audio_mode: "seg_fastest"   # "none" or "seg_fastest"

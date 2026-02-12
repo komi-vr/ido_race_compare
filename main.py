@@ -83,6 +83,8 @@ def tag(config_path: str):
     common = _get(cfg, "common", {})
     font_path = _get(common, "font_path", None)
 
+    reference_json_path = tag_cfg.get("reference_json_path", None)
+
     annotate_video(
         video_path,
         out_json_path,
@@ -90,7 +92,9 @@ def tag(config_path: str):
         resume_if_exists=resume_if_exists,
         window_size=window_size,
         font_path=font_path,
+        reference_json_path=reference_json_path,  # ★追加
     )
+
 
 
 @cli.command()
