@@ -1,3 +1,4 @@
 videos/*
 .venv
 *.mp4
+*.ttf
