@@ -2,25 +2,27 @@ from typing import List, Optional, Dict, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-# ===== moviepy import (1.x / 2.x compatible) =====
-MP_VER = "unknown"
-try:
-    # moviepy
-    import moviepy
-    MP_VER = getattr(moviepy, "__version__", "unknown")
-except Exception:
-    pass
-
-# VideoFileClip / VideoClip の import 経路も違うので吸収
+# ===== moviepy 1.x / 2.x import compatibility =====
 try:
     # moviepy 1.x
-    from moviepy.editor import VideoFileClip, VideoClip
+    from moviepy.editor import (
+        VideoFileClip,
+        VideoClip,
+        AudioFileClip,
+        CompositeAudioClip,
+        AudioClip,
+    )
     MOVIEPY_API = "v1"
 except Exception:
     # moviepy 2.x
-    from moviepy import VideoFileClip, VideoClip
+    from moviepy import (
+        VideoFileClip,
+        VideoClip,
+        AudioFileClip,
+        CompositeAudioClip,
+        AudioClip,
+    )
     MOVIEPY_API = "v2"
-
 
 from alignment import AlignmentPlan, find_segment_index, map_out_time_to_local
 
@@ -46,49 +48,125 @@ def _text_size(draw: ImageDraw.ImageDraw, font: ImageFont.FreeTypeFont, text: st
 
 
 def _make_videoclip(make_frame_fn, duration: float, fps: int):
-    """
-    moviepy 1.x / 2.x でVideoClip生成APIが違うので吸収する。
-    """
-    # moviepy 1.x: VideoClip(make_frame=..., duration=...).set_fps(...)
+    # moviepy 1.x
     if MOVIEPY_API == "v1":
-        clip = VideoClip(make_frame=make_frame_fn, duration=duration).set_fps(fps)
-        return clip
+        return VideoClip(make_frame=make_frame_fn, duration=duration).set_fps(fps)
 
-    # moviepy 2.x: VideoClip(frame_function=...) -> with_duration/with_fps
-    # 互換のため、存在するメソッドを順に試す
-    clip = None
-
-    # 2.x の代表: VideoClip(frame_function=...)
+    # moviepy 2.x
     try:
         clip = VideoClip(frame_function=make_frame_fn)
     except TypeError:
-        # 環境差: VideoClip(make_frame_fn) 形式の可能性もある
         clip = VideoClip(make_frame_fn)
 
-    # duration
     if hasattr(clip, "with_duration"):
         clip = clip.with_duration(duration)
     elif hasattr(clip, "set_duration"):
         clip = clip.set_duration(duration)
     else:
-        # 最悪: 属性直書き（古い互換用）
-        try:
-            clip.duration = duration
-        except Exception:
-            pass
+        clip.duration = duration
 
-    # fps
     if hasattr(clip, "with_fps"):
         clip = clip.with_fps(fps)
     elif hasattr(clip, "set_fps"):
         clip = clip.set_fps(fps)
     else:
-        try:
-            clip.fps = fps
-        except Exception:
-            pass
+        clip.fps = fps
 
     return clip
+
+
+def _set_audio_on_clip(clip, audio_clip):
+    if MOVIEPY_API == "v1":
+        return clip.set_audio(audio_clip)
+    # v2
+    if hasattr(clip, "with_audio"):
+        return clip.with_audio(audio_clip)
+    return clip.set_audio(audio_clip)
+
+
+def _make_silence(duration: float, fps: int = 44100):
+    # mono silence
+    def make_frame(t):
+        # t can be scalar or ndarray
+        if isinstance(t, np.ndarray):
+            return np.zeros((len(t), 1), dtype=np.float32)
+        return np.zeros((1,), dtype=np.float32)
+
+    if MOVIEPY_API == "v1":
+        return AudioClip(make_frame, duration=duration, fps=fps)
+    # v2
+    try:
+        a = AudioClip(frame_function=make_frame)
+    except TypeError:
+        a = AudioClip(make_frame)
+    if hasattr(a, "with_duration"):
+        a = a.with_duration(duration)
+    else:
+        a = a.set_duration(duration)
+    if hasattr(a, "with_fps"):
+        a = a.with_fps(fps)
+    else:
+        a = a.set_fps(fps)
+    return a
+
+
+def _build_segment_fastest_audio(
+    video_paths_list: List[str],
+    plan: AlignmentPlan,
+    total_out_dur: float,
+    audio_fps: int = 44100,
+) -> "CompositeAudioClip":
+    """
+    区間ごとに最短(=速い)動画の音声を採用。
+    - 各区間: fastest vid idx = argmin per_video_dur
+    - その区間の生時間ぶんだけ音声を切り出し
+    - 出力タイムラインの seg.out_start に配置
+    - 区間の“待ち”は無音（ベースのサイレンスで担保）
+    """
+    audio_srcs = [AudioFileClip(p) for p in video_paths_list]
+
+    pieces = []
+    base = _make_silence(total_out_dur, fps=audio_fps)
+
+    for seg_idx, seg in enumerate(plan.segments):
+        # fastest video for this segment
+        durs = seg.per_video_dur
+        fastest = min(range(len(durs)), key=lambda i: (durs[i], i))
+        seg_raw = float(durs[fastest])
+        if seg_raw <= 0:
+            continue
+
+        # segment local start time in that video (raw cumulative start)
+        prev_raw = plan.cum_raw_at_seg_end[seg_idx - 1][fastest] if seg_idx > 0 else 0.0
+        local_a = prev_raw
+        local_b = prev_raw + seg_raw
+
+        # audio subclip
+        try:
+            sub = audio_srcs[fastest].subclip(local_a, local_b)
+        except Exception:
+            # v2 naming sometimes "subclipped"
+            if hasattr(audio_srcs[fastest], "subclipped"):
+                sub = audio_srcs[fastest].subclipped(local_a, local_b)
+            else:
+                raise
+
+        # place at output segment start
+        if hasattr(sub, "set_start"):
+            sub = sub.set_start(seg.out_start)
+        elif hasattr(sub, "with_start"):
+            sub = sub.with_start(seg.out_start)
+        else:
+            # fallback
+            sub.start = seg.out_start
+
+        pieces.append(sub)
+
+    comp = CompositeAudioClip([base] + pieces)
+
+    # close sources (CompositeAudioClip keeps references; safest is not closing until end)
+    # We'll return comp and let caller close via source clips if needed.
+    return comp
 
 
 def render_comparison_video(
@@ -96,11 +174,24 @@ def render_comparison_video(
     plan: AlignmentPlan,
     out_path: str,
     *,
+    # layout
     out_w: int = 1280,
-    bar_h: int = 140,
-    margin: int = 8,
+    out_h: int = 720,
+    bar_h: int = 210,
+    margin: int = 10,
+
+    # fonts
     font_path: Optional[str] = None,
     fps: int = 60,
+
+    # timing labels
+    start_times: Optional[Dict[str, float]] = None,  # {"動画名": t_start}
+    end_times: Optional[Dict[str, float]] = None,    # {"動画名": t_end}
+
+    # audio
+    audio_mode: str = "none",  # "none" or "seg_fastest"
+    audio_fps: int = 44100,
+
     eps_hold: float = 1e-3,
 ) -> None:
     labels: List[str] = list(video_paths.keys())
@@ -111,12 +202,28 @@ def render_comparison_video(
     if n == 0:
         raise ValueError("video_paths is empty")
 
-    available_h = 720
-    vid_h_total = (available_h - margin * (n - 1))
-    vid_h_each = max(1, vid_h_total // n)
+    # defaults for start/end times
+    if start_times is None:
+        start_times = {lab: 0.0 for lab in labels}
+    if end_times is None:
+        end_times = {lab: clips[i].duration for i, lab in enumerate(labels)}
 
-    font_main = _load_font(font_path, 28)
+    # totals per video (start->end)
+    total_times = {}
+    for lab in labels:
+        total = float(end_times[lab] - start_times[lab])
+        if total < 1e-6:
+            total = 1e-6
+        total_times[lab] = total
+
+    # ===== layout: horizontal tiles =====
+    available_w = out_w - margin * (n - 1)
+    tile_w = max(1, available_w // n)
+    tile_h = max(1, out_h - bar_h)
+
+    font_main = _load_font(font_path, 30)
     font_small = _load_font(font_path, 22)
+    font_tiny = _load_font(font_path, 18)
 
     def make_frame(out_t: float) -> np.ndarray:
         seg_idx = find_segment_index(plan, out_t)
@@ -128,31 +235,46 @@ def render_comparison_video(
 
         seg_raw = seg.per_video_dur
         ref_raw = seg_raw[0]
-        seg_delta = [seg_raw[v] - ref_raw for v in range(n)]
 
-        cum_partial = []
+        # Δ区間（pre_start 等は差分計算しない）
+        if getattr(seg, "exclude_from_diff", False):
+            seg_delta = [0.0 for _ in range(n)]
+        else:
+            seg_delta = [seg_raw[v] - ref_raw for v in range(n)]
+
+        # cum_excl_partial（start以降のみの累積生時間）を使って Δ累積/順位を決める
+        cum_excl_partial = []
         for v in range(n):
+            prev_excl = plan.cum_excl_at_seg_end[seg_idx - 1][v] if seg_idx > 0 else 0.0
             partial_raw = min(dt_in_seg, seg_raw[v])
-            prev_cum = plan.cum_raw_at_seg_end[seg_idx - 1][v] if seg_idx > 0 else 0.0
-            cum_partial.append(prev_cum + partial_raw)
+            if getattr(seg, "exclude_from_diff", False):
+                cum_excl_partial.append(prev_excl)
+            else:
+                cum_excl_partial.append(prev_excl + partial_raw)
 
-        cum_ref = cum_partial[0]
-        cum_delta = [cum_partial[v] - cum_ref for v in range(n)]
+        cum_ref = cum_excl_partial[0]
+        cum_delta = [cum_excl_partial[v] - cum_ref for v in range(n)]
 
-        rank_order = sorted(range(n), key=lambda v: (cum_partial[v], v))
+        rank_order = sorted(range(n), key=lambda v: (cum_excl_partial[v], v))
         rank_of = {v: i + 1 for i, v in enumerate(rank_order)}
 
         hold_flags = [(dt_in_seg > (seg_raw[v] + eps_hold)) for v in range(n)]
 
-        canvas_h = bar_h + (vid_h_each * n) + margin * (n - 1)
-        canvas = Image.new("RGB", (out_w, canvas_h), (0, 0, 0))
+        # ===== canvas =====
+        canvas = Image.new("RGB", (out_w, out_h), (0, 0, 0))
         draw = ImageDraw.Draw(canvas)
 
         draw.rectangle([0, 0, out_w, bar_h], fill=(20, 20, 20))
-        seg_name = f"{seg.tag_a} → {seg.tag_b} (区間名: {seg.name})"
-        draw.text((16, 10), seg_name, font=font_main, fill=(255, 255, 255))
+
+        # segment title
+        if seg.tag_a == "__BEGIN__":
+            seg_title = f"pre-start → {seg.tag_b}（startまで：タイム差計算しない）"
+        else:
+            seg_title = f"{seg.tag_a} → {seg.tag_b} (区間名: {seg.name})"
+
+        draw.text((16, 10), seg_title, font=font_main, fill=(255, 255, 255))
         draw.text(
-            (16, 52),
+            (16, 54),
             f"区間経過(出力): {_format_time(dt_in_seg)} / {_format_time(seg.out_dur)}",
             font=font_small,
             fill=(220, 220, 220),
@@ -164,76 +286,99 @@ def render_comparison_video(
             fill=(220, 220, 220),
         )
 
-        x0 = out_w // 2
-        y0 = 52
-        line_h = 26
+        # per-video line (top)
+        base_y = 120
+        line_h = 24
         for v in range(n):
+            lab = labels[v]
             hold_txt = " HOLD" if hold_flags[v] else ""
             txt = (
-                f"#{rank_of[v]} {labels[v]}:{hold_txt} "
-                f"区間={_format_time(seg_raw[v])}  Δ区間={seg_delta[v]:+0.3f}s   Δ累積={cum_delta[v]:+0.3f}s"
+                f"#{rank_of[v]} {lab}{hold_txt} | "
+                f"区間={_format_time(seg_raw[v])}  Δ区間={seg_delta[v]:+0.3f}s  Δ累積={cum_delta[v]:+0.3f}s"
             )
-            draw.text(
-                (x0, y0 + v * line_h),
-                txt,
-                font=font_small,
-                fill=(255, 255, 255) if v == 0 else (200, 200, 200),
-            )
+            draw.text((16, base_y + v * line_h), txt, font=font_tiny, fill=(255, 255, 255))
 
         if prev_seg is not None:
-            prev_raw = prev_seg.per_video_dur
-            prev_ref = prev_raw[0]
-            prev_delta = [prev_raw[v] - prev_ref for v in range(n)]
-            base_y = bar_h - 26
-            draw.text(
-                (16, base_y),
-                f"前区間: {prev_seg.tag_a} → {prev_seg.tag_b}",
-                font=font_small,
-                fill=(140, 140, 140),
-            )
-            for v in range(n):
-                tprev = f"{labels[v]}: 区間={_format_time(prev_raw[v])}  Δ={prev_delta[v]:+0.3f}s"
-                draw.text((x0, base_y + v * 20), tprev, font=font_small, fill=(120, 120, 120))
+            py = bar_h - 26
+            if prev_seg.tag_a == "__BEGIN__":
+                ptitle = f"前区間: pre-start → {prev_seg.tag_b}"
+            else:
+                ptitle = f"前区間: {prev_seg.tag_a} → {prev_seg.tag_b}"
+            draw.text((16, py), ptitle, font=font_tiny, fill=(140, 140, 140))
 
+        # ===== tiles =====
+        x = 0
         y = bar_h
         for v, clip in enumerate(clips):
-            lt = local_ts[v]
-            frame = clip.get_frame(lt)
+            lab = labels[v]
+            lt = float(local_ts[v])
+            frame = clip.get_frame(lt)  # numpy RGB
             img = Image.fromarray(frame)
 
+            # cover -> crop to tile
             aspect = img.width / max(1, img.height)
-            target_w = out_w
+            target_w = tile_w
             target_h = int(target_w / max(1e-6, aspect))
-            if target_h < vid_h_each:
-                target_h = vid_h_each
+            if target_h < tile_h:
+                target_h = tile_h
                 target_w = int(target_h * aspect)
+
             img = img.resize((target_w, target_h), Image.BICUBIC)
+            left = max(0, (target_w - tile_w) // 2)
+            top = max(0, (target_h - tile_h) // 2)
+            img = img.crop((left, top, left + tile_w, top + tile_h))
+            canvas.paste(img, (x, y))
 
-            left = max(0, (target_w - out_w) // 2)
-            top = max(0, (target_h - vid_h_each) // 2)
-            img = img.crop((left, top, left + out_w, top + vid_h_each))
-            canvas.paste(img, (0, y))
+            # compute run elapsed/progress (start->end)
+            st = float(start_times.get(lab, 0.0))
+            et = float(end_times.get(lab, st + total_times[lab]))
+            total = float(total_times[lab])
 
-            label_text = f"#{rank_of[v]} {labels[v]}" + ("  HOLD" if hold_flags[v] else "")
+            elapsed = lt - st
+            if elapsed < 0:
+                elapsed = 0.0
+            if elapsed > total:
+                elapsed = total
+
+            progress = 100.0 * (elapsed / total) if total > 0 else 0.0
+
+            # label overlay (top-left of tile)
+            label_text = f"#{rank_of[v]} {lab}" + ("  HOLD" if hold_flags[v] else "")
             pad = 8
             tw, th = _text_size(draw, font_small, label_text)
             box_w = tw + pad * 2
             box_h = th + pad * 2
-            overlay = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 140))
-            canvas.paste(overlay, (12, y + 12), overlay)
-            draw.text((12 + pad, y + 12 + pad), label_text, font=font_small, fill=(255, 255, 255))
+            overlay = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 150))
+            canvas.paste(overlay, (x + 10, y + 10), overlay)
+            draw.text((x + 10 + pad, y + 10 + pad), label_text, font=font_small, fill=(255, 255, 255))
 
-            y += vid_h_each + margin
+            # total/progress overlay (bottom-left of tile)
+            info_text = f"TOTAL {_format_time(total)} | {_format_time(elapsed)} ({progress:5.1f}%)"
+            tw2, th2 = _text_size(draw, font_small, info_text)
+            box_w2 = tw2 + pad * 2
+            box_h2 = th2 + pad * 2
+            overlay2 = Image.new("RGBA", (box_w2, box_h2), (0, 0, 0, 150))
+            canvas.paste(overlay2, (x + 10, y + tile_h - box_h2 - 10), overlay2)
+            draw.text((x + 10 + pad, y + tile_h - box_h2 - 10 + pad), info_text, font=font_small, fill=(255, 255, 255))
+
+            x += tile_w + margin
 
         return np.asarray(canvas)
 
-    # ★ ここが今回の本丸：moviepyの違いを吸収してVideoClip生成
     out_clip = _make_videoclip(make_frame, plan.total_out_dur, fps)
+
+    # ===== audio =====
+    if audio_mode == "seg_fastest":
+        audio = _build_segment_fastest_audio(paths, plan, plan.total_out_dur, audio_fps=audio_fps)
+        out_clip = _set_audio_on_clip(out_clip, audio)
+    else:
+        # none
+        pass
 
     out_clip.write_videofile(
         out_path,
         codec="libx264",
-        audio=False,
+        audio=(audio_mode != "none"),
         fps=fps,
         threads=4,
         preset="medium",
